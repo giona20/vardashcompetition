@@ -95,7 +95,8 @@ with st.sidebar:
                                value=float(DEFAULTS["notional_usd"]), step=100.0, key="notional_val")
     leverage = st.slider("Leva", 1.0, 20.0, float(DEFAULTS["leverage"]), 0.5, key="leverage_val")
     mmr = st.number_input("Maintenance margin (%)", 0.1, 10.0, DEFAULTS["maintenance_margin"] * 100, 0.1,
-                          help="Approssimazione per stimare la liquidazione: verifica il valore reale su Variational.", key="mmr_val") / 100
+                          help="Approssimazione per stimare la liquidazione: verifica il valore reale su Variational.",
+                          key="mmr_val") / 100
     lookback = st.slider("Trimestrali passate da analizzare", 4, 12, DEFAULTS["lookback_quarters"], key="lookback_val")
     st.divider()
     auto = st.toggle("Aggiornamento live", value=True, key="auto_toggle")
@@ -144,7 +145,7 @@ def live_strip(day: dict) -> None:
                   f"{nxt[0]['report']} · {fmt_utc(nxt[1]['report_at'])}")
     else:
         c3.metric("Prossimo report", "—", "tutti i report del giorno sono usciti")
-    
+
     cols = st.columns(len(day["stocks"]))
     for col, s in zip(cols, day["stocks"]):
         lp = live(eg.yf_symbol(s))
@@ -165,7 +166,8 @@ with st.spinner(f"Analisi {day['label']} in corso (opzioni, storico trimestrali,
 
 pk = eg.picks(results)
 ok_results = [r for r in results if "error" not in r]
-tab_now, tab_analysis, tab_pos, tab_post = st.tabs(["Cosa fare oggi", "Analisi completa", "Posizioni e PnL card", "Post e invio"])
+tab_now, tab_strategy, tab_analysis, tab_pos, tab_post = st.tabs(
+    ["Cosa fare oggi", "Strategia multi-account", "Analisi completa", "Posizioni e PnL card", "Post e invio"])
 
 # ==============================================================================
 # TAB 1 - Cosa fare oggi
@@ -222,15 +224,15 @@ with tab_now:
         st.warning(f"Posizioni valide solo dopo il {fmt_utc(COMPETITION['positions_open_after'])}. Prepara il piano, non aprire ancora.")
     elif status["phase"] == "closed":
         st.error("La finestra della gara è chiusa.")
-    
+
     mism = [r for r in ok_results if r.get("date_mismatch")]
     for r in mism:
         st.warning(f"{r['ticker']}: Yahoo indica earnings il {r['yahoo_earnings_date']}, il calendario di gara dice {day['date']}. Verifica prima di entrare.")
-    
+
     for r in ok_results:
         if r.get("note"):
             st.caption(f"{r['ticker']}: {r['note']}")
-    
+
     if not pk:
         st.error("Nessun dato utilizzabile per questo giorno. Prova 'Ricalcola analisi'.")
     else:
@@ -250,7 +252,7 @@ with tab_now:
                 if pk["direction"]["ticker"] != pk["pct"]["ticker"]:
                     ticket(pk["direction"], "Direzione più convinta del giorno",
                            "Il titolo con più fattori concordi sulla direzione (resta una scommessa).")
-        
+
         st.subheader("Piano della giornata")
         rows = []
         for s in day["stocks"]:
@@ -269,6 +271,140 @@ with tab_now:
                      column_config={"Exp. move %": st.column_config.NumberColumn(format="%.1f")})
 
 # ==============================================================================
+# TAB STRATEGIA - Multi-account delta con TP/SL
+# ==============================================================================
+ACCOUNT_PROFILES = [
+    {"account": "A", "ruolo": "Caccia al % gain · aggressivo", "lato": "LONG",
+     "tp_x": 1.75, "sl_x": 0.45, "notional_x": 1.0, "leva": 5.0},
+    {"account": "B", "ruolo": "Caccia al $ gain · più capitale, meno leva", "lato": "LONG",
+     "tp_x": 1.00, "sl_x": 0.70, "notional_x": 2.0, "leva": 3.0},
+    {"account": "C", "ruolo": "Hedge · lato opposto (copre il coin flip)", "lato": "SHORT",
+     "tp_x": 1.75, "sl_x": 0.45, "notional_x": 1.0, "leva": 5.0},
+]
+
+def strategy_rows(r: dict, base_notional: float) -> list[dict]:
+    price = nz(r.get("price_usd"))
+    em = nz(r.get("score_implied_move_pct"))
+    if math.isnan(price) or price <= 0 or math.isnan(em) or em <= 0:
+        return []
+    rows = []
+    for pf in ACCOUNT_PROFILES:
+        sign = 1 if pf["lato"] == "LONG" else -1
+        tp_pct = em * pf["tp_x"]
+        sl_pct = em * pf["sl_x"]
+        rows.append({
+            "Account": pf["account"], "Ruolo": pf["ruolo"], "Ticker": r["ticker"],
+            "Lato": pf["lato"], "Entry": price,
+            "TP": price * (1 + sign * tp_pct / 100),
+            "SL": price * (1 - sign * sl_pct / 100),
+            "Notional": base_notional * pf["notional_x"], "Leva": pf["leva"],
+            "max_gain_usd": base_notional * pf["notional_x"] * tp_pct / 100,
+            "max_loss_usd": base_notional * pf["notional_x"] * sl_pct / 100,
+        })
+    return rows
+
+def strategy_live_df(rows: list[dict]) -> pd.DataFrame:
+    out = []
+    for p in rows:
+        stock = next((s for d in DAYS for s in d["stocks"] if s["ticker"] == p["Ticker"]), {"ticker": p["Ticker"]})
+        lp = live(eg.yf_symbol(stock))
+        px = nz(lp["price"]) * lp.get("fx_to_usd", 1.0)
+        sign = 1 if p["Lato"] == "LONG" else -1
+        if math.isnan(px):
+            stato, move, pnl, roe, d_tp, d_sl = "prezzo n/d", np.nan, np.nan, np.nan, np.nan, np.nan
+        else:
+            move = (px / p["Entry"] - 1) * 100 * sign
+            pnl = p["Notional"] * move / 100
+            roe = move * p["Leva"]
+            tp_hit = (sign > 0 and px >= p["TP"]) or (sign < 0 and px <= p["TP"])
+            sl_hit = (sign > 0 and px <= p["SL"]) or (sign < 0 and px >= p["SL"])
+            stato = "🎯 TP HIT" if tp_hit else ("🛑 SL HIT" if sl_hit else "in corso")
+            d_tp = (p["TP"] / px - 1) * 100 * sign
+            d_sl = (px / p["SL"] - 1) * 100 * sign
+        out.append({**p, "Ultimo": px, "Move %": move, "PnL $": pnl, "ROE %": roe,
+                    "Dist. TP %": d_tp, "Dist. SL %": d_sl, "Stato": stato})
+    return pd.DataFrame(out)
+
+with tab_strategy:
+    st.subheader("Strategia multi-account · delta con TP/SL")
+    st.caption("3 account × ticker = posizioni con TP/SL sfalsati per catturare il movimento massimo in entrambe "
+               "le direzioni. Livelli = multipli dell'expected move (A/C = 1.75×, B = 1.0×).")
+    if st.session_state.pop("strategy_loaded_msg", None):
+        st.success(st.session_state.pop("strategy_loaded_msg"))
+    if not ok_results:
+        st.error("Nessun dato utilizzabile per costruire la strategia.")
+    else:
+        opts = [r["ticker"] for r in ok_results]
+        defaults = []
+        if pk:
+            for cand in (pk["pct"]["ticker"], pk["direction"]["ticker"], pk["usd"]["ticker"]):
+                if cand not in defaults:
+                    defaults.append(cand)
+        sel = st.multiselect("Ticker da giocare (consigliati: i primi 2 del giorno)", opts,
+                             default=defaults[:2], key="strategy_tickers")
+        if len(sel) > 3:
+            st.warning("Massimo 3 ticker (9 posizioni): uso i primi 3 selezionati.")
+            sel = sel[:3]
+        all_rows = []
+        for t in sel:
+            r = next((x for x in ok_results if x["ticker"] == t), None)
+            if r:
+                all_rows += strategy_rows(r, float(notional))
+        if not all_rows:
+            st.info("Seleziona almeno un ticker per generare il piano.")
+        else:
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Posizioni", len(all_rows))
+            k2.metric("Notional totale", f"${sum(p['Notional'] for p in all_rows):,.0f}")
+            k3.metric("Gain max (tutti i TP)", f"+${sum(p['max_gain_usd'] for p in all_rows):,.0f}")
+            k4.metric("Loss max (tutti gli SL)", f"-${sum(p['max_loss_usd'] for p in all_rows):,.0f}")
+            st.caption("I lati A e C sono opposti: il loss max reale è molto inferiore, perché una gamba perde lo "
+                       "SL mentre l'altra è in guadagno.")
+
+            with st.expander("Piano statico (TP/SL e rischio per posizione)"):
+                st.dataframe(pd.DataFrame(all_rows)[["Account", "Ruolo", "Ticker", "Lato", "Entry", "TP", "SL",
+                                                     "Notional", "Leva", "max_gain_usd", "max_loss_usd"]],
+                             hide_index=True, width="stretch",
+                             column_config={c: st.column_config.NumberColumn(format="%.2f")
+                                            for c in ("Entry", "TP", "SL", "max_gain_usd", "max_loss_usd")})
+
+            @st.fragment(run_every=run_every)
+            def strategy_live(rows: list[dict]) -> None:
+                df = strategy_live_df(rows)
+                st.dataframe(df[["Account", "Ticker", "Lato", "Entry", "TP", "SL", "Ultimo", "Move %",
+                                 "PnL $", "ROE %", "Dist. TP %", "Dist. SL %", "Stato"]],
+                             hide_index=True, width="stretch",
+                             column_config={c: st.column_config.NumberColumn(format="%.2f")
+                                            for c in ("Entry", "TP", "SL", "Ultimo", "Move %", "PnL $",
+                                                      "ROE %", "Dist. TP %", "Dist. SL %")})
+                for _, row in df.iterrows():
+                    if row["Stato"] == "🎯 TP HIT":
+                        st.success(f"{row['Account']} · {row['Ticker']} {row['Lato']}: TP toccato a "
+                                   f"{row['Ultimo']:,.2f} → PnL {row['PnL $']:+,.0f} $ (ROE {row['ROE %']:+.0f}%). "
+                                   f"Screenshot della card ADESSO!")
+                    elif row["Stato"] == "🛑 SL HIT":
+                        st.error(f"{row['Account']} · {row['Ticker']} {row['Lato']}: SL toccato a {row['Ultimo']:,.2f} "
+                                 f"→ PnL {row['PnL $']:+,.0f} $. La gamba opposta dovrebbe coprire.")
+
+            strategy_live(all_rows)
+
+            if st.button("Carica queste posizioni nel tracker (tab 'Posizioni e PnL card')", key="load_strategy"):
+                tracker_rows = [{"Ticker": p["Ticker"], "Lato": p["Lato"], "Entry": round(p["Entry"], 2),
+                                 "Notional": p["Notional"], "Leva": p["Leva"], "Attiva": False,
+                                 "TP": round(p["TP"], 2), "SL": round(p["SL"], 2),
+                                 "Account": p["Account"]} for p in all_rows]
+                st.session_state.positions = tracker_rows
+                if "pos_editor" in st.session_state:
+                    del st.session_state["pos_editor"]
+                save_positions(tracker_rows)
+                st.session_state["strategy_loaded_msg"] = (
+                    f"{len(tracker_rows)} posizioni salvate in positions.json. Aprile su Variational nella finestra "
+                    "di ingresso consigliata, poi spunta 'Aperta' nel tab Posizioni.")
+                st.rerun()
+            st.caption("Esecuzione: ordini limite nella finestra di ingresso (es. 19:00–20:05 UTC), TP/SL come ordini "
+                       "GTC. Dopo il print, la card migliore è di solito nei 90-110 minuti successivi.")
+
+# ==============================================================================
 # TAB 2 - Analisi completa
 # ==============================================================================
 with tab_analysis:
@@ -278,7 +414,7 @@ with tab_analysis:
     st.caption("Exp. move = prezzo della straddle ATM sulla prima scadenza dopo il report, in % del prezzo. "
                "Reaz. media = media |variazione close→close| nel giorno di reazione delle trimestrali passate. "
                "Opportunità misura la grandezza del movimento atteso, non la direzione.")
-    
+
     if ok_results:
         tick = st.selectbox("Titolo", [r["ticker"] for r in ok_results], key="analysis_select")
         r = next(x for x in ok_results if x["ticker"] == tick)
@@ -312,7 +448,7 @@ with tab_analysis:
                 st.plotly_chart(fig2, width="stretch")
             else:
                 st.info("Nessuna trimestrale storica trovata su Yahoo per questo titolo.")
-        
+
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("IV ATM", f"{nz(r.get('opt_atm_iv_pct')):.0f}%" if not math.isnan(nz(r.get('opt_atm_iv_pct'))) else "n/d")
         m2.metric("Straddle ATM", f"${nz(r.get('opt_straddle')):.2f}" if not math.isnan(nz(r.get('opt_straddle'))) else "n/d",
@@ -321,7 +457,7 @@ with tab_analysis:
         m4.metric("Skew put-call", f"{nz(r.get('opt_skew_put_minus_call')):+.1f} pt" if not math.isnan(nz(r.get('opt_skew_put_minus_call'))) else "n/d")
         m5.metric("HV 20d / 60d", f"{nz(r.get('tech_hv20')):.0f}% / {nz(r.get('tech_hv60')):.0f}%")
         m6.metric("RSI 14", f"{nz(r.get('tech_rsi14')):.0f}")
-        
+
         with st.expander("Fattori direzionali"):
             st.dataframe(pd.DataFrame(r.get("factors", [])), hide_index=True, width="stretch")
         with st.expander("Trimestrali passate"):
@@ -339,13 +475,13 @@ with tab_pos:
         st.session_state.positions = load_positions()
     if "peaks" not in st.session_state:
         st.session_state.peaks = {}
-    
+
     base = pd.DataFrame(st.session_state.positions or [],
                         columns=["Ticker", "Lato", "Entry", "Notional", "Leva", "Attiva"])
     if base.empty:
         base = pd.DataFrame([{"Ticker": day["stocks"][0]["ticker"], "Lato": "LONG", "Entry": 0.0,
                               "Notional": float(notional), "Leva": float(leverage), "Attiva": False}])
-    
+
     all_tickers = sorted({s["ticker"] for d in DAYS for s in d["stocks"]})
     edited = st.data_editor(
         base, num_rows="dynamic", hide_index=True, width="stretch", key="pos_editor",
@@ -362,7 +498,7 @@ with tab_pos:
     if rows != st.session_state.positions:
         st.session_state.positions = rows
         save_positions(rows)
-    
+
     retrace = st.slider("Avvisami se il PnL ritraccia dal massimo di", 10, 60, int(DEFAULTS["peak_retrace_alert"] * 100), 5,
                         format="%d%%", key="retrace_slider") / 100
 
@@ -372,7 +508,6 @@ with tab_pos:
         if not active:
             st.info("Nessuna posizione aperta: spunta 'Aperta' e metti il prezzo di ingresso.")
             return
-        
         out = []
         for p in active:
             stock = next((s for d in DAYS for s in d["stocks"] if s["ticker"] == p["Ticker"]), {"ticker": p["Ticker"]})
@@ -384,16 +519,19 @@ with tab_pos:
             pnl = notl * move / 100 if not math.isnan(move) else np.nan
             roe = move * lev if not math.isnan(move) else np.nan
             liq = entry * (1 - 1 / lev + mmr) if p["Lato"] == "LONG" else entry * (1 + 1 / lev - mmr)
-            
             key = f"{p['Ticker']}|{p['Lato']}|{entry}"
             peak = st.session_state.peaks.get(key, -1e9)
             if not math.isnan(roe) and roe > peak:
                 peak = roe
                 st.session_state.peaks[key] = peak
-            
             from_peak = (peak - roe) if not math.isnan(roe) and peak > -1e9 else np.nan
+            tp, sl = nz(p.get("TP"), 0), nz(p.get("SL"), 0)
             if math.isnan(roe):
                 alert = "prezzo n/d"
+            elif tp > 0 and ((sign > 0 and price >= tp) or (sign < 0 and price <= tp)):
+                alert = f"🎯 TP {tp:,.2f} toccato: posta la card o chiudi"
+            elif sl > 0 and ((sign > 0 and price <= sl) or (sign < 0 and price >= sl)):
+                alert = f"🛑 SL {sl:,.2f} toccato: piano rispettato"
             elif roe <= 0:
                 alert = "sotto ingresso"
             elif peak > 0 and from_peak >= peak * retrace:
@@ -402,22 +540,18 @@ with tab_pos:
                 alert = "📸 nuovo massimo: momento buono per la card"
             else:
                 alert = "in guadagno"
-            
             out.append({"Ticker": p["Ticker"], "Lato": p["Lato"], "Entry": entry, "Ultimo": price,
                         "Fonte": lp["source"], "Move %": move, "PnL $": pnl, "ROE %": roe,
                         "Max ROE %": peak if peak > -1e9 else np.nan, "Liq. stimata": liq, "Segnale": alert})
-        
         df = pd.DataFrame(out)
         st.dataframe(df, hide_index=True, width="stretch",
                      column_config={c: st.column_config.NumberColumn(format="%.2f") for c in df.columns if df[c].dtype.kind == "f"})
-        
         tot = df["PnL $"].sum(skipna=True)
         st.metric("PnL totale", f"{tot:+,.2f} $", f"aggiornato {eg.now_utc().strftime('%H:%M:%S')} UTC")
-        
         for a in df["Segnale"]:
-            if a.startswith("⚠️"):
+            if a.startswith("⚠️") or a.startswith("🛑"):
                 st.warning(a)
-            elif a.startswith("📸"):
+            elif a.startswith("📸") or a.startswith("🎯"):
                 st.success(a)
 
     positions_live(retrace)
@@ -438,7 +572,7 @@ with tab_post:
             "Link del post salvato per il form",
         ]:
             st.checkbox(item, key=f"chk_{item[:30]}")
-    
+
     with c2:
         st.subheader("Bozza del post (premio 'best post')")
         opts = [f"{p['Ticker']} {p['Lato']}" for p in st.session_state.get("positions", []) if p.get("Attiva")] or [
@@ -449,7 +583,8 @@ with tab_post:
         r = next((x for x in ok_results if x["ticker"] == tk), None)
         em = nz(r["score_implied_move_pct"]) if r else np.nan
         thesis = st.text_input("Tesi in una riga (inglese, è per X)",
-                               value=f"options priced a ±{em:.0f}% move, history says it usually delivers" if not math.isnan(em) else "", key="thesis_input")
+                               value=f"options priced a ±{em:.0f}% move, history says it usually delivers" if not math.isnan(em) else "",
+                               key="thesis_input")
         pnl_txt = st.text_input("Risultato (es. +42% ROE)", value="+__% ROE", key="pnl_input")
         post = (f"${tk} {side.lower()} into earnings on @variational_io perps.\n"
                 f"Thesis: {thesis}\n"
