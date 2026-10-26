@@ -1,32 +1,26 @@
 """
 Monitor di alert per la Variational PnL Card Competition.
-
 Gira in un terminale separato dalla dashboard:
     python alert_monitor.py            # giorno automatico
     python alert_monitor.py day2       # forza un giorno
-
 Manda su Discord e/o Telegram (vedi ALERTS in config.py):
   - il piano del giorno (una volta)
   - apertura della finestra di ingresso di ogni titolo
   - countdown al report (X minuti prima)
   - movimento post-report oltre le soglie (3/5/8/12/20 %)
-  - per le posizioni in positions.json: nuovo massimo di ROE, ritracciamento dal massimo,
-    vicinanza alla liquidazione
+  - per le posizioni in positions.json: TP/SL toccati, nuovo massimo di ROE,
+    ritracciamento dal massimo, vicinanza alla liquidazione
 Lo stato (alert già inviati, prezzi di riferimento) è in alerts_state.json, così un riavvio
 non rimanda tutto.
 """
-
 from __future__ import annotations
-
 import json
 import math
 import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-
 import requests
-
 import engine as eg
 from config import ALERTS, DAYS, DEFAULTS
 
@@ -34,7 +28,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(HERE, "alerts_state.json")
 POSITIONS_FILE = os.path.join(HERE, "positions.json")
 UTC = timezone.utc
-
 
 # ---------------------------------------------------------------------------
 # invio
@@ -56,7 +49,6 @@ def send(msg: str) -> None:
         except Exception as e:
             print(f"  telegram KO: {e}")
 
-
 # ---------------------------------------------------------------------------
 # stato
 # ---------------------------------------------------------------------------
@@ -67,11 +59,9 @@ def load_json(path: str, default):
     except Exception:
         return default
 
-
 def save_json(path: str, data) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=str)
-
 
 def once(state: dict, key: str) -> bool:
     """True la prima volta che viene chiamata con quella chiave."""
@@ -80,7 +70,6 @@ def once(state: dict, key: str) -> bool:
         return False
     sent[key] = datetime.now(UTC).isoformat()
     return True
-
 
 # ---------------------------------------------------------------------------
 # blocchi di controllo
@@ -102,7 +91,6 @@ def daily_plan(day: dict, state: dict) -> None:
                      f"🧭 Direzione più convinta: {pk['direction']['ticker']} {pk['direction']['score_direction']}")
     send("\n".join(lines))
 
-
 def timing_alerts(day: dict, state: dict, now: datetime) -> None:
     warn = timedelta(minutes=int(ALERTS["report_warning_minutes"]))
     for s in day["stocks"]:
@@ -113,7 +101,6 @@ def timing_alerts(day: dict, state: dict, now: datetime) -> None:
         if timedelta(0) < tg["to_report"] <= warn and once(state, f"soon:{s['ticker']}:{day['date']}"):
             send(f"⏰ {s['ticker']}: report tra {int(tg['to_report'].total_seconds() // 60)} minuti. "
                  f"Ultima chiamata per entrare o per decidere di restare fuori.")
-
 
 def post_report_moves(day: dict, state: dict, now: datetime) -> None:
     refs = state.setdefault("ref_price", {})
@@ -145,7 +132,6 @@ def post_report_moves(day: dict, state: dict, now: datetime) -> None:
                      f"Soglia {th}% superata.")
                 break
 
-
 def position_alerts(state: dict) -> None:
     positions = load_json(POSITIONS_FILE, [])
     peaks = state.setdefault("peaks", {})
@@ -163,6 +149,18 @@ def position_alerts(state: dict) -> None:
         move = (price / entry - 1) * 100 * sign
         roe = move * lev
         key = f"{p['Ticker']}|{p['Lato']}|{entry}"
+        acct = p.get("Account", "?")
+
+        # --- TP / SL (piano multi-account) -----------------------------------
+        tp, sl = eg._f(p.get("TP"), 0), eg._f(p.get("SL"), 0)
+        if tp > 0 and ((sign > 0 and price >= tp) or (sign < 0 and price <= tp)) and once(state, f"tp:{key}"):
+            send(f"🎯 Account {acct} · {p['Ticker']} {p['Lato']}: TP {tp:.2f} TOCCATO (prezzo {price:.2f}, "
+                 f"ROE {roe:+.1f}%). Chiudi o posta la card ORA!")
+        if sl > 0 and ((sign > 0 and price <= sl) or (sign < 0 and price >= sl)) and once(state, f"sl:{key}"):
+            send(f"🛑 Account {acct} · {p['Ticker']} {p['Lato']}: SL {sl:.2f} toccato (prezzo {price:.2f}, "
+                 f"ROE {roe:+.1f}%). Piano rispettato: la gamba opposta dovrebbe coprire.")
+
+        # --- nuovi massimi di ROE / ritracciamento ----------------------------
         prev_peak = peaks.get(key, -1e9)
         if roe > prev_peak:
             peaks[key] = roe
@@ -170,14 +168,15 @@ def position_alerts(state: dict) -> None:
                 send(f"📸 {p['Ticker']} {p['Lato']}: nuovo massimo ROE {roe:+.1f}% (prezzo {price:.2f}). Buon momento per la card.")
         elif prev_peak > 0 and prev_peak - roe >= prev_peak * DEFAULTS["peak_retrace_alert"]:
             if once(state, f"retrace:{key}:{int(prev_peak)}"):
-                send(f"⚠️ {p['Ticker']} {p['Lato']}: ROE {roe:+.1f}%, ritracciato dal massimo {prev_peak:+.1f}%. "
+                send(f"️ {p['Ticker']} {p['Lato']}: ROE {roe:+.1f}%, ritracciato dal massimo {prev_peak:+.1f}%. "
                      f"Valuta di postare la card o chiudere.")
+
+        # --- vicinanza liquidazione -------------------------------------------
         liq_move = -(1 / lev - mmr) * 100  # movimento (nel verso contrario) che liquida
         if move < 0 and move <= liq_move * (1 - ALERTS["liq_proximity"]):
             if once(state, f"liq:{key}:{int(move)}"):
                 send(f"🛑 {p['Ticker']} {p['Lato']}: move {move:+.1f}% su leva {lev:g}x, liquidazione stimata a {liq_move:.1f}%. "
                      f"Sei vicino: riduci o chiudi.")
-
 
 # ---------------------------------------------------------------------------
 # main loop
@@ -203,7 +202,6 @@ def main() -> None:
         except Exception as e:
             print(f"errore nel ciclo: {e}")
         time.sleep(interval)
-
 
 if __name__ == "__main__":
     main()
